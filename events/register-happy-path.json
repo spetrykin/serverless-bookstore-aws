@@ -1,0 +1,26 @@
+{
+  "resource": "/register",
+  "path": "/register",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "multiValueHeaders": {
+    "Content-Type": ["application/json"]
+  },
+  "queryStringParameters": null,
+  "multiValueQueryStringParameters": null,
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourceId": "test-resource",
+    "resourcePath": "/register",
+    "httpMethod": "POST",
+    "requestId": "test-invoke-register-happy-path",
+    "accountId": "123456789012",
+    "identity": {},
+    "apiId": "test-api-id"
+  },
+  "body": "{\"name\":\"New User\",\"email\":\"newuser@example.com\",\"password\":\"correct-horse-battery-staple\",\"confirmPassword\":\"correct-horse-battery-staple\",\"birthday\":\"1990-01-01\",\"gender\":\"other\"}",
+  "isBase64Encoded": false
+}

@@ -1,0 +1,850 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Bookstore — serverless pet-project (Java 25 + Spring Boot, SnapStart)
+
+Globals:
+  Function:
+    Runtime: java25
+    Timeout: 15
+    MemorySize: 512
+    SnapStart:
+      ApplyOn: PublishedVersions
+    AutoPublishAlias: live
+    # Lambda-level top-level segment only (architecture-plan.md §5.15) — confirmed
+    # via the canonical AWS::Serverless::Function reference that AWS SAM
+    # auto-attaches arn:aws:iam::aws:policy/AWSXrayWriteOnlyAccess to the
+    # generated execution role when Tracing is Active/PassThrough and no
+    # explicit Role: is set (true for all 15 functions here), so no
+    # per-function Policies: entry is needed for this, unlike the
+    # JwtSigningKeyReadStatement/DynamoDbDescribeTableStatement pattern in
+    # §5.10. AWS::Serverless::HttpApi has no tracing-related property at all
+    # (confirmed against its full documented Properties list — unlike
+    # AWS::Serverless::Api's TracingEnabled) — so this traces Lambda
+    # execution only, never an API-Gateway-originated segment for the
+    # request itself. SDK-call subsegments (DynamoDB/EventBridge) are a
+    # separate, deferred decision — see architecture-plan.md §5.15.
+    Tracing: Active
+    Environment:
+      Variables:
+        # Only the SSM parameter *name*, never the secret value — fetched at
+        # cold start via the SDK (see JwtProperties / architecture-plan.md
+        # §5.9; ssm-secure dynamic references aren't valid here).
+        JWT_SIGNING_KEY_PARAM: /bookstore/jwt-signing-key
+        # SAM's Java-Maven build workflow copies target/classes + flat
+        # dependency jars — it doesn't know about spring-boot-maven-plugin's
+        # `repackage` goal/classifier, so the Start-Class manifest entry
+        # never reaches the deployed artifact. FunctionClassUtils checks
+        # MAIN_CLASS before manifest scanning, so this is required, not
+        # optional (see architecture-plan.md §5.9/local-invoke verification).
+        MAIN_CLASS: com.serhii.bookstore.BookstoreApplication
+    # Note: `Policies` isn't a supported Globals.Function property (SAM
+    # transform rejects it outright) — the ssm:GetParameter statement below
+    # is repeated per-function instead, via a YAML anchor to avoid drift.
+
+Resources:
+  BookstoreTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: bookstore
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+        - AttributeName: GSI1PK
+          AttributeType: S
+        - AttributeName: GSI1SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      GlobalSecondaryIndexes:
+        - IndexName: GSI1-visible-books
+          KeySchema:
+            - AttributeName: GSI1PK
+              KeyType: HASH
+            - AttributeName: GSI1SK
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      TimeToLiveSpecification:
+        AttributeName: expiresAt
+        Enabled: true
+
+  # Diagnostic-only, added to chase the authorizer 500 (docs/architecture-plan.md
+  # §5.1) — AWS's own troubleshooting doc for this exact symptom points here:
+  # "$context.authorizer.error" is the only way to see API Gateway's own reason
+  # for rejecting an authorizer response, since CloudWatch Logs for the Lambda
+  # itself only shows what the function returned, not whether API Gateway
+  # accepted it. RetentionInDays kept short — this is not meant to be
+  # long-lived observability infra for a pet project, delete once the
+  # authorizer issue is resolved if not otherwise useful (see CLAUDE.md
+  # "Cleanup after deploy" for why sam delete won't remove this on its own).
+  HttpApiAccessLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/apigateway/bookstore-dev-access-logs
+      RetentionInDays: 7
+
+  # Without this, API Gateway sets AccessLogSettings on the stage successfully
+  # (confirmed via `aws apigatewayv2 get-stage`) but never actually delivers
+  # any log events — confirmed empirically: log group stayed at 0 bytes,
+  # `aws logs describe-resource-policies`/`describe-deliveries` were both
+  # empty before this. Applied manually first via `aws logs
+  # put-resource-policy` as a fast diagnostic check (didn't show immediate
+  # effect, possibly propagation lag — not conclusively ruled out as also
+  # needed), then promoted here so template.yaml stays the source of truth
+  # and this doesn't silently survive a future `sam delete` as
+  # account-level drift. If this alone doesn't unblock log delivery, the
+  # next thing to check is whether the deploying (`bookstore` admin)
+  # principal has `logs:CreateLogDelivery` and related permissions — AWS's
+  # HTTP API logging docs list those as required on the *caller* activating
+  # logging, a different, newer mechanism than this classic resource
+  # policy (see docs/architecture-plan.md §5.1 for the full trace).
+  HttpApiAccessLogGroupPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: bookstore-dev-apigateway-access-logs
+      PolicyDocument: !Sub |
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Sid": "AllowApiGatewayAccessLogsBookstoreDev",
+              "Effect": "Allow",
+              "Principal": {
+                "Service": "apigateway.amazonaws.com"
+              },
+              "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+              "Resource": "${HttpApiAccessLogGroup.Arn}:*",
+              "Condition": {
+                "ArnLike": {
+                  "aws:SourceArn": "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BookstoreHttpApi}"
+                }
+              }
+            }
+          ]
+        }
+
+  BookstoreHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      AccessLogSettings:
+        DestinationArn: !GetAtt HttpApiAccessLogGroup.Arn
+        Format: '{"requestId":"$context.requestId","routeKey":"$context.routeKey","status":"$context.status","authorizerError":"$context.authorizer.error","integrationErrorMessage":"$context.integrationErrorMessage","responseLength":"$context.responseLength"}'
+      RouteSettings:
+        "POST /login":
+          ThrottlingBurstLimit: 5
+          ThrottlingRateLimit: 2
+      Auth:
+        Authorizers:
+          BookstoreAuthorizer:
+            FunctionArn: !Ref AuthorizerFunction.Alias
+            FunctionPayloadType: REQUEST
+            AuthorizerPayloadFormatVersion: "2.0"
+            # false (not true): AuthorizerFunction returns IamPolicyResponse, the
+            # classic policy-document contract — a week-1→week-2 reversal from the
+            # originally-simpler "simple response" shape, forced by a
+            # spring-cloud-function-adapter-aws limitation discovered only on real
+            # deploy. Full writeup — architecture-plan.md §5.1.
+            #
+            # DOCUMENTED INTENT, NOT ENFORCED: the server-side AWS::Serverless-2016-10-31
+            # transform has a truthy-check bug (`if self.enable_simple_responses:` instead
+            # of `is not None`, aws-sam-translator model/apigatewayv2.py) that silently
+            # drops `EnableSimpleResponses: false` from the generated OpenAPI authorizer
+            # definition every time — confirmed both by reading that source directly and
+            # by pulling this stack's actual processed template
+            # (`aws cloudformation get-template --template-stage Processed`), which
+            # independently showed the same omission. API Gateway then defaults
+            # enableSimpleResponses to true when the key is absent — the opposite of what
+            # this line says. This value is kept here as the documented desired state
+            # (harmless — SAM just ignores it), not because it's actually enforced.
+            # REQUIRED MANUAL STEP after any deploy touching BookstoreAuthorizer — see
+            # CLAUDE.md "Mandatory manual step after a deploy that touches BookstoreAuthorizer" /
+            # docs/incident-log.md for the full trace.
+            EnableSimpleResponses: false
+            AuthorizerResultTtlInSeconds: 0
+            Identity:
+              Headers:
+                - Authorization
+        # Secure by default: every route requires BookstoreAuthorizer unless
+        # it explicitly opts out with `Auth: Authorizer: NONE` (Register/
+        # Login/Refresh below). Catalog/Order (week 2) get protected
+        # automatically without needing to remember to add anything.
+        DefaultAuthorizer: BookstoreAuthorizer
+
+  RegisterFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # E3030 false positive: cfn-lint's schema lags behind AWS's actual
+      # Lambda runtime list (see architecture-plan.md §5.9) — java25 is
+      # real and GA. Caveat: AWS::Serverless::* Metadata can be dropped by
+      # the SAM transform before cfn-lint's final pass; verify this
+      # actually takes effect rather than assuming.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: register
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt BookstoreTable.Arn
+            - &JwtSigningKeyReadStatement
+              Effect: Allow
+              Action:
+                - ssm:GetParameter
+              Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/bookstore/jwt-signing-key"
+            - &DynamoDbDescribeTableStatement
+              Effect: Allow
+              Action:
+                - dynamodb:DescribeTable
+              Resource: !GetAtt BookstoreTable.Arn
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /register
+            Method: POST
+            PayloadFormatVersion: "1.0"
+            Auth:
+              Authorizer: NONE
+
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # E3030 false positive: cfn-lint's schema lags behind AWS's actual
+      # Lambda runtime list (see architecture-plan.md §5.9) — java25 is
+      # real and GA. Caveat: AWS::Serverless::* Metadata can be dropped by
+      # the SAM transform before cfn-lint's final pass; verify this
+      # actually takes effect rather than assuming.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: login
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                # PutItem: LoginService uses the shared TokenService (§5.5),
+                # which writes a new RefreshTokenItem on every login, not
+                # just on register — see architecture-plan.md §5.3/incident-log.md.
+                - dynamodb:PutItem
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /login
+            Method: POST
+            PayloadFormatVersion: "1.0"
+            Auth:
+              Authorizer: NONE
+
+  RefreshFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # E3030 false positive: cfn-lint's schema lags behind AWS's actual
+      # Lambda runtime list (see architecture-plan.md §5.9) — java25 is
+      # real and GA. Caveat: AWS::Serverless::* Metadata can be dropped by
+      # the SAM transform before cfn-lint's final pass; verify this
+      # actually takes effect rather than assuming.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: refresh
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # dynamodb:UpdateItem intentionally NOT granted here — RefreshService.refresh() traced
+      # end to end (final IAM audit, 2026-08-18): only
+      # RefreshTokenRepository.findByUserIdAndJti() and UserRepository.findById() are called,
+      # both GetItem, no write anywhere in this path. Matches §5.14's "no rotation in week 1"
+      # design — UpdateItem here was a stale over-grant (likely anticipating rotation that was
+      # never implemented), not a real requirement. Removed, not just left as-is.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /refresh
+            Method: POST
+            PayloadFormatVersion: "1.0"
+            Auth:
+              Authorizer: NONE
+
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      # E3030 false positive: cfn-lint's schema lags behind AWS's actual
+      # Lambda runtime list (see architecture-plan.md §5.9) — java25 is
+      # real and GA. Caveat: AWS::Serverless::* Metadata can be dropped by
+      # the SAM transform before cfn-lint's final pass; verify this
+      # actually takes effect rather than assuming.
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: authorize
+      # ssm:GetParameter (JWT verification) + dynamodb:DescribeTable — NOT
+      # zero DynamoDB access: DynamoDbCracResource is an unconditional
+      # @Component, present in every function's shared Spring context,
+      # so its afterRestore() describeTable call fires here too even
+      # though this function's own handler never touches DynamoDB
+      # (see architecture-plan.md §5.10). No item-level read/write.
+      Policies:
+        - Statement:
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+
+  # SAM auto-generates an AWS::Lambda::Permission for every backend-integration
+  # function, but NOT for AuthorizerFunction itself. Confirmed empirically:
+  # every other function got its own "...ApiPermission" resource, this one
+  # didn't, and `aws lambda get-policy` on AuthorizerFunction/its "live" alias
+  # both came back ResourceNotFoundException (no resource policy at all).
+  # Without this, every protected route 500s before Lambda is ever invoked —
+  # API Gateway can't invoke the authorizer, so it never reaches the backend
+  # function either.
+  # This matches a documented AWS::Serverless::HttpApi gap, not a guess: SAM
+  # doesn't auto-wire the invoke permission for a FunctionArn-referenced
+  # REQUEST authorizer under HttpApi at all (see
+  # github.com/aws/serverless-application-model issues #2933 and #2049 — same
+  # symptom, same manual-Lambda::Permission workaround). Whether this is
+  # specific to the AutoPublishAlias-qualified ARN used here
+  # (FunctionArn: !Ref AuthorizerFunction.Alias, on BookstoreHttpApi.Auth.Authorizers
+  # above) or would also happen with a bare function ARN is NOT confirmed by
+  # those sources — don't restate that narrower claim as established.
+  # Never caught earlier because §5.8 already flags that sam local start-api
+  # can't exercise this authorizer at all, so Week 1 (Register/Login/Refresh,
+  # all Auth: Authorizer: NONE) never exercised this path even on the real
+  # deployed stack — this is the first route that ever actually required it.
+  AuthorizerFunctionApiPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref AuthorizerFunction.Alias
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${BookstoreHttpApi}/authorizers/*"
+
+  CatalogListFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: catalogList
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # Doesn't decode a JWT in its own handler code, but *JwtSigningKeyReadStatement
+      # is still required — JwtProperties is an unconditional @Component in the shared
+      # Spring context (same class of fact as DynamoDbCracResource/DescribeTable, §5.10),
+      # so every function's cold start constructs it regardless of whether that
+      # function's own route ever calls jwtService. Confirmed the hard way: first
+      # deploy attempt failed AccessDeniedException on ssm:GetParameter for all 6 new
+      # functions — see incident-log.md.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${BookstoreTable.Arn}/index/GSI1-visible-books"
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /books
+            Method: GET
+            PayloadFormatVersion: "1.0"
+
+  AdminBookListFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminBookList
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # Scan + filter, not a GSI — deliberate for pet-project catalog scale
+      # (architecture-plan.md §6.2). ADMIN enforcement is app-level
+      # (AuthorizerContext.requireAdmin()), not expressible at the HttpApi/
+      # authorizer level — see architecture-plan.md §4 notes.
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment above / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/books
+            Method: GET
+            PayloadFormatVersion: "1.0"
+
+  AdminBookCreateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminBookCreate
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/books
+            Method: POST
+            PayloadFormatVersion: "1.0"
+
+  AdminBookUpdateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminBookUpdate
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # GetItem: DynamoDbBookRepository.updateBook reads the existing item first, to preserve
+      # createdAt across the full-replace UpdateItem (see repository javadoc).
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/books/{bookId}
+            Method: PUT
+            PayloadFormatVersion: "1.0"
+
+  OrderCreateFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: orderCreate
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # GetItem: per-line book snapshot/visibility check (OrderService), before the transaction.
+      # PutItem/UpdateItem: the individual actions inside the TransactWriteItems call
+      # (DynamoDbOrderRepository) — both the wrapper action and the underlying per-item
+      # actions need to be granted, same pattern as RegisterFunction's transactional write.
+      # events:PutEvents: OrderEventPublisher, week 3 (architecture-plan.md §1.2) — publishes
+      # OrderCreated to the default event bus *after* the transaction above commits.
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt BookstoreTable.Arn
+            - Effect: Allow
+              Action:
+                - events:PutEvents
+              # Default event bus has a fixed, well-known ARN pattern — not something SAM
+              # generates a !GetAtt for the way it does for BookstoreTable.Arn, so this is
+              # !Sub by hand. No wildcard resource.
+              Resource: !Sub "arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/default"
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /orders
+            Method: POST
+            PayloadFormatVersion: "1.0"
+
+  OrderListFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: orderList
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /orders
+            Method: GET
+            PayloadFormatVersion: "1.0"
+
+  OrderCreatedConsumerFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: orderCreatedConsumer
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # dynamodb:PutItem — idempotency guard row (events/repository/ProcessedEventRepository,
+      # architecture-plan.md §1.4). *JwtSigningKeyReadStatement required despite not decoding JWTs
+      # itself — see CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      # SAM's EventBridgeRule event source auto-creates both the AWS::Events::Rule and the
+      # AWS::Lambda::Permission for events.amazonaws.com to invoke this function — verify this
+      # empirically right after the first deploy of this resource (the first-deploy
+      # verification checkpoint), not assumed just because it's documented SAM behavior. This
+      # project's history (AuthorizerFunctionApiPermission, week 2) is exactly a case where SAM
+      # did NOT auto-generate an invoke permission for a superficially similar case.
+      Events:
+        OrderCreated:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source:
+                - bookstore.orders
+              detail-type:
+                - OrderCreated
+
+  AdminUserListFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminUserList
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # Scan + filter, not a GSI — same deliberate pet-project-scale precedent as AdminBookListFunction
+      # (architecture-plan.md §6.2). *JwtSigningKeyReadStatement required despite
+      # not decoding JWTs itself — see CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/users
+            Method: GET
+            PayloadFormatVersion: "1.0"
+
+  AdminUserBlockFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminUserBlock
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # UpdateItem: flips UserItem.status to BLOCKED. Query: finds every REFRESH# row for the target
+      # user so AdminUserService can revoke them all (closes §5.2's week-3 flag).
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/users/{userId}/block
+            Method: POST
+            PayloadFormatVersion: "1.0"
+
+  AdminUserUnblockFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminUserUnblock
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # UpdateItem only: flips UserItem.status back to ACTIVE, deliberately does not touch
+      # REFRESH# rows. *JwtSigningKeyReadStatement required despite not
+      # decoding JWTs itself — see CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:UpdateItem
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/users/{userId}/unblock
+            Method: POST
+            PayloadFormatVersion: "1.0"
+
+  AdminUserDeleteFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: adminUserDelete
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+      # GetItem: reads the existing UserItem first (needs its email for the second transactional
+      # delete key). TransactWriteItems + DeleteItem: atomic delete of UserItem + EmailAccountItem,
+      # mirrors RegisterFunction's transactional write in reverse. DeleteItem
+      # is NOT redundant with TransactWriteItems — IAM authorizes the underlying per-item action
+      # (Delete here, Put/Update elsewhere) separately from the wrapper action, same pattern already
+      # documented on RegisterFunction/OrderCreateFunction; missed here on first pass, caught by a
+      # real AccessDeniedException on a real deploy, not by review — see docs/incident-log.md
+      # 2026-08-11. Orders are deliberately left untouched — no Delete/Query on ORDER# items here.
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:DeleteItem
+                - dynamodb:TransactWriteItems
+              Resource: !GetAtt BookstoreTable.Arn
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /admin/users/{userId}
+            Method: DELETE
+            PayloadFormatVersion: "1.0"
+
+  RecommendationFunction:
+    Type: AWS::Serverless::Function
+    Metadata:
+      cfn-lint:
+        config:
+          ignore_checks:
+            - E3030
+    Properties:
+      CodeUri: .
+      Handler: org.springframework.cloud.function.adapter.aws.FunctionInvoker::handleRequest
+      Environment:
+        Variables:
+          SPRING_CLOUD_FUNCTION_DEFINITION: recommendations
+          BOOKSTORE_TABLE_NAME: !Ref BookstoreTable
+          # Mock by default — flipping to "bedrock" is a deliberate,
+          # separate manual step (CLAUDE.md's Bedrock guardrails), never implied by this deploy.
+          RECS_MODE: mock
+      # Two SEPARATE dynamodb:Query statements, not one shared resource — a real bug caught on a
+      # real deploy, not anticipated at design time (docs/incident-log.md 2026-08-20):
+      # OrderRepository.findByUserId queries the BASE TABLE (PK=USER#...), but
+      # BookRepository.listVisible queries GSI1-visible-books — DynamoDB IAM authorizes a GSI Query
+      # against the *index's own ARN* (${BookstoreTable.Arn}/index/GSI1-visible-books), not the base
+      # table ARN, even though it's the same dynamodb:Query action. CatalogListFunction already
+      # scopes its GSI1 Query this same way — missed applying that same precedent here at design
+      # time, caught by a real AccessDeniedException-shaped DynamoDbException against seeded data,
+      # not by review. bedrock:InvokeModel needs BOTH ARNs together — the inference-profile ARN
+      # authorizes invoking the Geo (EU) profile itself, but the request can route to any of that
+      # profile's destination regions (eu-central-1/eu-north-1/eu-west-1/eu-west-3), each
+      # independently checking the foundation-model ARN — hence the wildcard region on that second
+      # ARN, still scoped to this one exact model.
+      # Only this function gets bedrock:InvokeModel — BedrockRecommendationEngine is a genuine
+      # Spring @ConditionalOnProperty bean (RECS_MODE=bedrock only), never constructed in any other
+      # function's shared context, unlike the §5.10 "unconditional @Component" cases.
+      # *JwtSigningKeyReadStatement required despite not decoding JWTs itself — see
+      # CatalogListFunction's comment / architecture-plan.md §5.10.
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !GetAtt BookstoreTable.Arn
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${BookstoreTable.Arn}/index/GSI1-visible-books"
+            - Effect: Allow
+              Action:
+                - bedrock:InvokeModel
+              Resource:
+                - !Sub "arn:aws:bedrock:${AWS::Region}:${AWS::AccountId}:inference-profile/eu.amazon.nova-micro-v1:0"
+                - "arn:aws:bedrock:*::foundation-model/amazon.nova-micro-v1:0"
+            - *JwtSigningKeyReadStatement
+            - *DynamoDbDescribeTableStatement
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref BookstoreHttpApi
+            Path: /recommendations
+            Method: GET
+            PayloadFormatVersion: "1.0"
+
+Outputs:
+  TableName:
+    Value: !Ref BookstoreTable
+  HttpApiUrl:
+    Value: !Sub "https://${BookstoreHttpApi}.execute-api.${AWS::Region}.amazonaws.com"

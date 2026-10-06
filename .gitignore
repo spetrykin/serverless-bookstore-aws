@@ -1,0 +1,7 @@
+target/
+.aws-sam/
+*.class
+.idea/
+*.iml
+.env
+.claude/settings.local.json

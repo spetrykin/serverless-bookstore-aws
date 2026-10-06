@@ -1,0 +1,18 @@
+{
+  "version": "0",
+  "id": "b3f4a1d2-9c3e-4a2b-8f1d-2e5c6d7a8b9c",
+  "detail-type": "OrderCreated",
+  "source": "bookstore.orders",
+  "account": "123456789012",
+  "time": "2026-08-11T12:00:05Z",
+  "region": "eu-central-1",
+  "resources": [],
+  "detail": {
+    "orderId": "order-week3-fixture-1",
+    "userId": "PLACEHOLDER-REPLACE-WITH-REAL-USER-ID",
+    "totalCents": 9000,
+    "lineCount": 1,
+    "createdAt": "2026-08-11T12:00:00Z"
+  },
+  "_comment": "Redelivery of the same order-created-consumer-first.json event (same orderId, different EventBridge id/time — matches real at-least-once redelivery, which doesn't reuse the original event id). Run order-created-consumer-first.json against the deployed stack first so the idempotency guard row (PK=EVENT#order-week3-fixture-1) already exists, then run this one and confirm the CloudWatch log shows 'duplicate delivery, skipping' rather than a second 'processed' line (architecture-plan.md §1.4)."
+}

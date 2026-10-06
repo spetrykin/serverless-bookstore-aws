@@ -1,0 +1,29 @@
+{
+  "version": "2.0",
+  "type": "REQUEST",
+  "routeArn": "arn:aws:execute-api:eu-central-1:123456789012:test-api-id/$default/GET/catalog",
+  "identitySource": ["Bearer PLACEHOLDER-REPLACE-WITH-REAL-SIGNED-VALID-ACCESS-JWT"],
+  "routeKey": "GET /catalog",
+  "rawPath": "/catalog",
+  "rawQueryString": "",
+  "headers": {
+    "authorization": "Bearer PLACEHOLDER-REPLACE-WITH-REAL-SIGNED-VALID-ACCESS-JWT"
+  },
+  "requestContext": {
+    "accountId": "123456789012",
+    "apiId": "test-api-id",
+    "domainName": "test-api-id.execute-api.eu-central-1.amazonaws.com",
+    "http": {
+      "method": "GET",
+      "path": "/catalog",
+      "protocol": "HTTP/1.1",
+      "sourceIp": "127.0.0.1",
+      "userAgent": "curl/8.0"
+    },
+    "requestId": "test-invoke-authorizer-valid",
+    "routeKey": "GET /catalog",
+    "stage": "$default",
+    "time": "01/Jan/2026:00:00:00 +0000",
+    "timeEpoch": 1735689600000
+  }
+}

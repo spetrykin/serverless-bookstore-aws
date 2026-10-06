@@ -1,0 +1,75 @@
+name: CI
+
+# Validation/build gate only — no deployment stage.
+#
+# `sam deploy` is never run here, by design: CLAUDE.md's project rules state
+# deployment is a manual, human-run step only (via scripts/deploy.sh), never
+# performed by an agent or a pipeline. Accordingly this workflow needs no AWS
+# credentials/OIDC role at all — `sam build` builds the deployable artifact
+# locally on the runner without calling any AWS API; only `sam deploy`/
+# `sam package` would need credentials, and neither appears below.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Test, validate, build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up JDK 25 (Temurin)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: mvn test
+        run: mvn --batch-mode test
+
+      - name: Set up AWS SAM CLI
+        uses: aws-actions/setup-sam@v3
+
+      - name: sam validate --lint
+        run: sam validate --lint
+
+      - name: sam build
+        run: sam build
+
+  # Frontend build gate. Separate job (not a step in `validate`) so a
+  # frontend failure is visible on its own and the two jobs run in parallel.
+  # Build only — no deploy, no AWS credentials, no secrets (see header).
+  frontend:
+    name: Frontend build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # Node 24: frontend/package.json has no "engines" field, so this is the
+      # major version `npm ci && npm run build` was verified against locally
+      # (v24.18.0). Vite 8 requires ^20.19.0 || >=22.12.0 — 24 satisfies it.
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run build
+        run: npm run build

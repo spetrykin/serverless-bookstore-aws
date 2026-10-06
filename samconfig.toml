@@ -1,0 +1,14 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "bookstore-dev"
+resolve_s3 = true
+s3_prefix = "bookstore-dev"
+region = "eu-central-1"
+# profile = "<admin-profile>"  # set your own AWS profile, or pass --profile on the command line
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+image_repositories = []
+
+[default.global.parameters]
+region = "eu-central-1"

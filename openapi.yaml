@@ -1,0 +1,818 @@
+openapi: 3.0.3
+info:
+  title: Bookstore API
+  description: >
+    Serverless bookstore backend — JWT auth (register/login/refresh),
+    a public book catalog with admin CRUD, order placement with
+    immutable price snapshots, admin user management, and Bedrock-backed
+    recommendations. Hand-authored against the real DTOs and Lambda
+    handlers in src/main/java/com/serhii/bookstore (see
+    docs/architecture-plan.md for the design rationale behind each
+    endpoint) — this is a snapshot of the API surface as of Stretch
+    §7.1 item 3, not a generated artifact, so re-check it against the
+    code if either drifts.
+  version: "1.0.0"
+  license:
+    name: UNLICENSED
+servers:
+  - url: https://{apiId}.execute-api.eu-central-1.amazonaws.com
+    description: dev (bookstore-dev stack, eu-central-1)
+    variables:
+      apiId:
+        default: example
+        description: API Gateway id of your own deployed stack (the subdomain of its HttpApiUrl output).
+
+tags:
+  - name: Auth
+    description: Registration, login, token refresh. No auth required.
+  - name: Catalog
+    description: Public book listing, plus admin book CRUD.
+  - name: Order
+    description: Placing orders and listing a user's own order history.
+  - name: Admin Users
+    description: Admin-only user management — list, block, unblock, delete.
+  - name: Recommendations
+    description: Personalized (or fallback) book recommendations.
+
+security:
+  - bearerAuth: []
+
+paths:
+  /register:
+    post:
+      operationId: register
+      tags: [Auth]
+      summary: Register a new user
+      description: >
+        Auto-login on success (requirements.md: registering immediately
+        signs the user in) — the response already carries a usable
+        access/refresh token pair, no separate /login call needed.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Registered and auto-logged-in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RegisterResponse'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          description: Email already registered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: duplicate_email
+                message: Email is already registered
+
+  /login:
+    post:
+      operationId: login
+      tags: [Auth]
+      summary: Log in with email and password
+      description: >
+        "No such email" and "wrong password" both return the same
+        401 (anti-enumeration) — only a blocked account is distinguished
+        (403), since reaching that check already proves the password
+        was correct.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Logged in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid email or password (deliberately indistinguishable).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: invalid_credentials
+                message: Invalid email or password
+        '403':
+          description: Account is blocked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: user_blocked
+                message: Account is blocked
+
+  /refresh:
+    post:
+      operationId: refresh
+      tags: [Auth]
+      summary: Exchange a refresh token for a new access token
+      description: >
+        No rotation — the same refresh token stays valid across repeated
+        calls until its own 14-day expiry. A blocked user's *next*
+        refresh call fails immediately (live status re-check on every
+        call); an already-issued access token is unaffected until its
+        own 15-minute TTL.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RefreshRequest'
+      responses:
+        '200':
+          description: New access token issued.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RefreshResponse'
+        '401':
+          description: Refresh token invalid, expired, revoked, or not recognized.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: invalid_token
+                message: Refresh token has been revoked
+        '403':
+          description: The token's owner account is blocked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: user_blocked
+                message: Account is blocked
+
+  /books:
+    get:
+      operationId: listBooks
+      tags: [Catalog]
+      summary: List visible books
+      description: Any authenticated user. Visible-only (via GSI1) — hidden books never appear here.
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+      responses:
+        '200':
+          description: A page of visible books.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/books:
+    get:
+      operationId: adminListBooks
+      tags: [Catalog]
+      summary: List all books (visible + hidden)
+      description: Requires ADMIN role.
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+      responses:
+        '200':
+          description: A page of all books, visible and hidden.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      operationId: createBook
+      tags: [Catalog]
+      summary: Create a book
+      description: Requires ADMIN role.
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookRequest'
+      responses:
+        '201':
+          description: Book created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/books/{bookId}:
+    put:
+      operationId: updateBook
+      tags: [Catalog]
+      summary: Update a book (full replace)
+      description: >
+        Requires ADMIN role. Full replace, not a partial patch — every
+        field is required, including `visible` (omitting it is not
+        "leave unchanged," unlike create's default-to-true).
+      x-required-role: ADMIN
+      parameters:
+        - name: bookId
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateBookRequest'
+      responses:
+        '200':
+          description: Book updated.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Book'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: Book not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: book_not_found
+                message: Book not found
+
+  /orders:
+    post:
+      operationId: placeOrder
+      tags: [Order]
+      summary: Place an order
+      description: >
+        Any authenticated user. Prices are snapshotted from the book's
+        current price at order time and never change afterward, even if
+        the book's price is later updated by an admin. Stock is
+        decremented atomically and conditionally — insufficient stock at
+        commit time fails the whole order (409), no partial orders.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PlaceOrderRequest'
+      responses:
+        '201':
+          description: Order placed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          description: A referenced book doesn't exist or isn't visible (same 404 either way — no enumeration of hidden book IDs).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: book_not_found
+                message: Book not found
+        '409':
+          description: Insufficient stock for one or more lines at commit time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: insufficient_stock
+                message: Insufficient stock
+    get:
+      operationId: listOrders
+      tags: [Order]
+      summary: List the caller's own orders
+      description: Any authenticated user — scoped to the caller's own orders only (userId comes from the authorizer context, not a request parameter).
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+      responses:
+        '200':
+          description: A page of the caller's own orders, most recent first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/users:
+    get:
+      operationId: adminListUsers
+      tags: [Admin Users]
+      summary: List users
+      description: Requires ADMIN role.
+      x-required-role: ADMIN
+      parameters:
+        - $ref: '#/components/parameters/cursor'
+      responses:
+        '200':
+          description: A page of users.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserPage'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/users/{userId}/block:
+    post:
+      operationId: blockUser
+      tags: [Admin Users]
+      summary: Block a user
+      description: >
+        Requires ADMIN role. Rejects blocking your own account (400).
+        Immediately revokes every one of the target user's active
+        refresh tokens — not just the next refresh attempt — but an
+        already-issued access token remains valid until its own
+        15-minute TTL.
+      x-required-role: ADMIN
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User blocked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserActionResult'
+              example:
+                userId: 00077e15-2a87-4e98-b785-1878a0d2d213
+                status: BLOCKED
+        '400':
+          description: Validation error, including "cannot block your own account".
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+
+  /admin/users/{userId}/unblock:
+    post:
+      operationId: unblockUser
+      tags: [Admin Users]
+      summary: Unblock a user
+      description: >
+        Requires ADMIN role. Deliberately does not restore the refresh
+        tokens revoked at block time — an unblocked user logs in fresh
+        and gets new tokens.
+      x-required-role: ADMIN
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User unblocked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserActionResult'
+              example:
+                userId: 00077e15-2a87-4e98-b785-1878a0d2d213
+                status: ACTIVE
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+
+  /admin/users/{userId}:
+    delete:
+      operationId: deleteUser
+      tags: [Admin Users]
+      summary: Delete a user
+      description: >
+        Requires ADMIN role. Rejects deleting your own account (400).
+        Deletes the user's profile and email-uniqueness record
+        transactionally; the user's past orders are deliberately left
+        in place (immutable historical records, same rationale as the
+        price-snapshot decision), not cascade-deleted. An already-issued
+        access token for the deleted account keeps authenticating until
+        its own 15-minute TTL — deletion is not instant revocation.
+      x-required-role: ADMIN
+      parameters:
+        - name: userId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: User deleted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminUserDeleteResult'
+              example:
+                userId: 00077e15-2a87-4e98-b785-1878a0d2d213
+                deleted: true
+        '400':
+          description: Validation error, including "cannot delete your own account".
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/UserNotFound'
+
+  /recommendations:
+    get:
+      operationId: getRecommendations
+      tags: [Recommendations]
+      summary: Get book recommendations
+      description: >
+        Any authenticated user. `source` is `"personalized"` (order
+        history exists and the recommendation engine produced usable
+        results) or `"fallback"` (no order history yet, or the engine
+        failed — the failure itself is always logged server-side with
+        its specific cause, never silent). Currently always mock logic
+        in this deployment (RECS_MODE=mock); switching to a real Bedrock
+        call is a separate, explicitly-confirmed operational step, not
+        something this API contract exposes as a client-controllable
+        option.
+      responses:
+        '200':
+          description: A list of recommended books.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecommendationResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >
+        Access token from /register, /login, or /refresh, sent as
+        `Authorization: Bearer <token>`. Enforced by a Lambda REQUEST
+        authorizer (AWS API Gateway HttpApi) — stateless, validates
+        signature/expiry/token-type only, no per-request DynamoDB read.
+        The real AWS-side wiring (Lambda ARN, identity source, etc.) is
+        deliberately not reproduced here via x-amazon-apigateway-authorizer
+        — this scheme describes the client-facing contract, not the AWS
+        deployment artifact; see template.yaml for the latter.
+
+  parameters:
+    cursor:
+      name: cursor
+      in: query
+      required: false
+      description: Opaque pagination cursor from a previous page's `nextCursor`. Omit for the first page.
+      schema:
+        type: string
+
+  responses:
+    ValidationError:
+      description: Request failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: validation_error
+            message: Name is required
+    Forbidden:
+      description: Caller is authenticated but lacks the ADMIN role.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: forbidden
+            message: Admin role required
+    UserNotFound:
+      description: No user with that ID.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            code: user_not_found
+            message: User not found
+
+  schemas:
+    ErrorResponse:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error identifier (e.g. "validation_error", "book_not_found").
+        message:
+          type: string
+
+    RegisterRequest:
+      type: object
+      required: [name, email, password, confirmPassword, birthday, gender]
+      properties:
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+          minLength: 8
+        confirmPassword:
+          type: string
+          format: password
+        birthday:
+          type: string
+          format: date
+          example: "1990-01-01"
+        gender:
+          type: string
+          description: Free-form — no fixed allow-list.
+
+    RegisterResponse:
+      type: object
+      required: [userId, name, accessToken, refreshToken]
+      properties:
+        userId:
+          type: string
+        name:
+          type: string
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    LoginResponse:
+      type: object
+      required: [userId, accessToken, refreshToken]
+      properties:
+        userId:
+          type: string
+        accessToken:
+          type: string
+        refreshToken:
+          type: string
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+
+    RefreshResponse:
+      type: object
+      required: [accessToken]
+      properties:
+        accessToken:
+          type: string
+
+    Book:
+      type: object
+      required: [bookId, name, priceCents, count, photoUrl, visible]
+      properties:
+        bookId:
+          type: string
+        name:
+          type: string
+        priceCents:
+          type: integer
+          format: int64
+        count:
+          type: integer
+          format: int32
+          description: Real inventory count, not a boolean flag — 0 means "Absent" in the storefront UI.
+        photoUrl:
+          type: string
+        visible:
+          type: boolean
+          description: Soft-hide — a hidden book still exists and is still visible to admins via GET /admin/books.
+
+    BookPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Book'
+        nextCursor:
+          type: string
+          nullable: true
+          description: Pass as ?cursor= on the next request; null/absent once there are no more pages.
+
+    CreateBookRequest:
+      type: object
+      required: [name, priceCents, count]
+      properties:
+        name:
+          type: string
+        priceCents:
+          type: integer
+          format: int64
+        count:
+          type: integer
+          format: int32
+        photoUrl:
+          type: string
+        visible:
+          type: boolean
+          default: true
+          description: Defaults to true (shown) when omitted.
+
+    UpdateBookRequest:
+      type: object
+      required: [name, priceCents, count, visible]
+      properties:
+        name:
+          type: string
+        priceCents:
+          type: integer
+          format: int64
+        count:
+          type: integer
+          format: int32
+        photoUrl:
+          type: string
+        visible:
+          type: boolean
+          description: Required on this full-replace endpoint — no implicit default, unlike create.
+
+    PlaceOrderLine:
+      type: object
+      required: [bookId, quantity]
+      properties:
+        bookId:
+          type: string
+        quantity:
+          type: integer
+          format: int32
+          minimum: 1
+
+    PlaceOrderRequest:
+      type: object
+      required: [lines]
+      properties:
+        lines:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/PlaceOrderLine'
+
+    OrderLine:
+      type: object
+      required: [bookId, name, priceCents, quantity]
+      properties:
+        bookId:
+          type: string
+        name:
+          type: string
+          description: Snapshotted book name at order time.
+        priceCents:
+          type: integer
+          format: int64
+          description: Snapshotted price at order time — never re-derived from the book's current price.
+        quantity:
+          type: integer
+          format: int32
+
+    Order:
+      type: object
+      required: [orderId, lines, totalCents, createdAt]
+      properties:
+        orderId:
+          type: string
+        lines:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderLine'
+        totalCents:
+          type: integer
+          format: int64
+        createdAt:
+          type: string
+          format: date-time
+
+    OrderPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Order'
+        nextCursor:
+          type: string
+          nullable: true
+
+    AdminUser:
+      type: object
+      required: [userId, name, email, gender, status]
+      properties:
+        userId:
+          type: string
+        name:
+          type: string
+        email:
+          type: string
+          format: email
+        gender:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, BLOCKED]
+
+    AdminUserPage:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminUser'
+        nextCursor:
+          type: string
+          nullable: true
+
+    AdminUserActionResult:
+      type: object
+      required: [userId, status]
+      properties:
+        userId:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, BLOCKED]
+
+    AdminUserDeleteResult:
+      type: object
+      required: [userId, deleted]
+      properties:
+        userId:
+          type: string
+        deleted:
+          type: boolean
+
+    RecommendationResponse:
+      type: object
+      required: [books, source]
+      properties:
+        books:
+          type: array
+          items:
+            $ref: '#/components/schemas/Book'
+        source:
+          type: string
+          enum: [personalized, fallback]

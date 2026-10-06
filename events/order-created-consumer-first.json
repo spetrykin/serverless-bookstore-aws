@@ -1,0 +1,18 @@
+{
+  "version": "0",
+  "id": "6a7e8feb-b491-4cf7-a9f1-bf3703467718",
+  "detail-type": "OrderCreated",
+  "source": "bookstore.orders",
+  "account": "123456789012",
+  "time": "2026-08-11T12:00:00Z",
+  "region": "eu-central-1",
+  "resources": [],
+  "detail": {
+    "orderId": "order-week3-fixture-1",
+    "userId": "PLACEHOLDER-REPLACE-WITH-REAL-USER-ID",
+    "totalCents": 9000,
+    "lineCount": 1,
+    "createdAt": "2026-08-11T12:00:00Z"
+  },
+  "_comment": "First delivery of an OrderCreated event — same envelope shape EventBridge actually delivers to OrderCreatedConsumerFunction (see events.function.OrderCreatedConsumerFunction's javadoc on why ScheduledEvent is the right input type despite the name). orderId is a placeholder; must not collide with an existing EVENT#<orderId> row in the deployed table or this stops being a 'first delivery' case. See order-created-consumer-duplicate.json for the redelivery counterpart."
+}

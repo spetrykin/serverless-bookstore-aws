@@ -1,0 +1,27 @@
+{
+  "resource": "/refresh",
+  "path": "/refresh",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "multiValueHeaders": {
+    "Content-Type": ["application/json"]
+  },
+  "queryStringParameters": null,
+  "multiValueQueryStringParameters": null,
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourceId": "test-resource",
+    "resourcePath": "/refresh",
+    "httpMethod": "POST",
+    "requestId": "test-invoke-refresh-revoked-token",
+    "accountId": "123456789012",
+    "identity": {},
+    "apiId": "test-api-id"
+  },
+  "_comment": "refreshToken here is a placeholder — a real one must be a JWT signed with the deployed JWT_SIGNING_KEY_PARAM value, with its jti matching a REFRESH# item in DynamoDB that has status=REVOKED. Regenerate this once a dev stack exists; see chat for why it can't be produced offline.",
+  "body": "{\"refreshToken\":\"PLACEHOLDER-REPLACE-WITH-REAL-SIGNED-REVOKED-REFRESH-JWT\"}",
+  "isBase64Encoded": false
+}

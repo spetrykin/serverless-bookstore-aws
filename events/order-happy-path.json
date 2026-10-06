@@ -1,0 +1,33 @@
+{
+  "resource": "/orders",
+  "path": "/orders",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "multiValueHeaders": {
+    "Content-Type": ["application/json"]
+  },
+  "queryStringParameters": null,
+  "multiValueQueryStringParameters": null,
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourceId": "test-resource",
+    "resourcePath": "/orders",
+    "httpMethod": "POST",
+    "requestId": "test-invoke-order-happy-path",
+    "accountId": "123456789012",
+    "identity": {},
+    "apiId": "test-api-id",
+    "authorizer": {
+      "lambda": {
+        "userId": "PLACEHOLDER-REPLACE-WITH-REAL-USER-ID",
+        "role": "USER"
+      }
+    }
+  },
+  "_comment": "sam local invoke never runs through BookstoreAuthorizer (architecture-plan.md §5.8), so requestContext.authorizer is hand-crafted here — see common.security.AuthorizerContext's javadoc on the nested-vs-flat wire-shape caveat this fixture assumes (nested under \"lambda\", HttpApi's documented shape). bookId must be a book that exists, is visible, and has count >= 2 on the deployed table; regenerate once a book has been created via POST /admin/books.",
+  "body": "{\"lines\":[{\"bookId\":\"PLACEHOLDER-REPLACE-WITH-REAL-VISIBLE-BOOK-ID\",\"quantity\":2}]}",
+  "isBase64Encoded": false
+}

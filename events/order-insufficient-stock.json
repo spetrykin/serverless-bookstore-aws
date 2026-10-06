@@ -1,0 +1,33 @@
+{
+  "resource": "/orders",
+  "path": "/orders",
+  "httpMethod": "POST",
+  "headers": {
+    "Content-Type": "application/json"
+  },
+  "multiValueHeaders": {
+    "Content-Type": ["application/json"]
+  },
+  "queryStringParameters": null,
+  "multiValueQueryStringParameters": null,
+  "pathParameters": null,
+  "stageVariables": null,
+  "requestContext": {
+    "resourceId": "test-resource",
+    "resourcePath": "/orders",
+    "httpMethod": "POST",
+    "requestId": "test-invoke-order-insufficient-stock",
+    "accountId": "123456789012",
+    "identity": {},
+    "apiId": "test-api-id",
+    "authorizer": {
+      "lambda": {
+        "userId": "PLACEHOLDER-REPLACE-WITH-REAL-USER-ID",
+        "role": "USER"
+      }
+    }
+  },
+  "_comment": "Expects 409 insufficient_stock. bookId must be a visible book on the deployed table whose count is lower than the requested quantity below (e.g. count=1, quantity=2) — regenerate once such a book exists. Same authorizer-context wire-shape caveat as order-happy-path.json.",
+  "body": "{\"lines\":[{\"bookId\":\"PLACEHOLDER-REPLACE-WITH-REAL-LOW-STOCK-BOOK-ID\",\"quantity\":9999}]}",
+  "isBase64Encoded": false
+}
